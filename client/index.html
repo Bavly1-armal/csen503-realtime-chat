@@ -1,0 +1,180 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CSEN503 Chat</title>
+<style>
+  * { box-sizing: border-box; }
+  body { margin: 0; font-family: system-ui, sans-serif; background: #f2f3f5; height: 100dvh; display: flex; flex-direction: column; }
+  header { background: #1f6feb; color: #fff; padding: 10px 14px; display: flex; justify-content: space-between; align-items: center; }
+  header b { font-size: 17px; }
+  #status { font-size: 12px; padding: 3px 8px; border-radius: 10px; background: #d1242f; }
+  #status.on { background: #1a7f37; }
+  #login { margin: auto; display: flex; flex-direction: column; gap: 10px; width: 80%; max-width: 320px; }
+  input, button { font-size: 16px; padding: 10px; border-radius: 8px; border: 1px solid #ccc; }
+  button { background: #1f6feb; color: #fff; border: none; }
+  #app { display: none; flex: 1; flex-direction: column; min-height: 0; }
+  #contacts { display: flex; gap: 6px; padding: 8px; overflow-x: auto; background: #fff; border-bottom: 1px solid #ddd; }
+  .contact { padding: 6px 12px; border-radius: 16px; background: #e7ebf0; white-space: nowrap; cursor: pointer; }
+  .contact.active { background: #1f6feb; color: #fff; }
+  .contact .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: #aaa; margin-right: 5px; }
+  .contact .dot.online { background: #2da44e; }
+  .badge { background: #d1242f; color: #fff; border-radius: 9px; padding: 0 6px; margin-left: 5px; font-size: 12px; }
+  #log { flex: 1; overflow-y: auto; padding: 10px; display: flex; flex-direction: column; gap: 6px; }
+  .msg { max-width: 75%; padding: 8px 11px; border-radius: 12px; background: #fff; align-self: flex-start; word-wrap: break-word; }
+  .msg.me { background: #d6e8ff; align-self: flex-end; }
+  .msg small { display: block; color: #777; font-size: 11px; margin-top: 3px; }
+  #hint { color: #777; text-align: center; margin-top: 30px; }
+  #composer { display: flex; gap: 6px; padding: 8px; background: #fff; border-top: 1px solid #ddd; }
+  #composer input { flex: 1; }
+</style>
+</head>
+<body>
+<header><b>CSEN503 Chat</b><span id="status">offline</span></header>
+
+<div id="login">
+  <input id="nameInput" placeholder="Your name" autocomplete="off">
+  <button id="joinBtn">Join</button>
+</div>
+
+<div id="app">
+  <div id="contacts"></div>
+  <div id="log"><div id="hint">Pick someone above to chat with</div></div>
+  <form id="composer">
+    <input id="textInput" placeholder="Message" autocomplete="off">
+    <button>Send</button>
+  </form>
+</div>
+
+<script>
+// ------------------------------------------------------------ state
+let me = "";               // my username
+let ws = null;             // current WebSocket
+let current = "";          // who I'm chatting with
+let lastSeq = 0;           // highest server seq I have -> used to sync after reconnect
+const byId = new Map();    // message id -> message (de-duplicates everything we display)
+const outbox = new Map();  // id -> message sent but not yet acked by server (resent on reconnect)
+let online = [];
+const unread = {};
+
+const $ = (id) => document.getElementById(id);
+
+// crypto.randomUUID only works on https/localhost, so build our own id
+const newId = () => Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 10);
+
+// ------------------------------------------------------------ connection
+function connect() {
+  ws = new WebSocket(`ws://${location.host}/ws/${encodeURIComponent(me)}`);
+
+  ws.onopen = () => {
+    setStatus(true);
+    ws.send(JSON.stringify({ type: "sync", after: lastSeq }));  // get what I missed
+    for (const m of outbox.values()) sendFrame(m);              // resend un-acked messages
+  };
+
+  ws.onmessage = (e) => {
+    const data = JSON.parse(e.data);
+    if (data.type === "users")   { online = data.online; renderContacts(); }
+    if (data.type === "history") { data.messages.forEach(store); render(); }
+    if (data.type === "ack")     { outbox.delete(data.message.id); store(data.message); render(); }
+    if (data.type === "chat")    { store(data.message); render(); }
+    if (data.type === "error")   { console.warn("server:", data.reason); }
+  };
+
+ ws.onclose = (e) => {
+    if (e.code === 4000) { $("status").textContent = "opened in another tab"; return; }
+    setStatus(false);
+    setTimeout(connect, 1000);  // auto-reconnect
+ };
+ }
+
+function sendFrame(m) {
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({ type: "chat", id: m.id, to: m.to, text: m.text }));
+  }
+}
+
+// phones pause pages in the background: reconnect quickly when we come back
+document.addEventListener("visibilitychange", () => {
+  if (!document.hidden && ws && ws.readyState === WebSocket.CLOSED) connect();
+});
+
+// ------------------------------------------------------------ messages
+function store(m) {
+  const isNew = !byId.has(m.id) || byId.get(m.id).pending;
+  byId.set(m.id, m);
+  if (m.seq) lastSeq = Math.max(lastSeq, m.seq);
+  const other = m.from === me ? m.to : m.from;
+  if (isNew && m.from !== me && other !== current) unread[other] = (unread[other] || 0) + 1;
+}
+
+$("composer").onsubmit = (e) => {
+  e.preventDefault();
+  const text = $("textInput").value.trim();
+  if (!text || !current) return;
+  const m = { id: newId(), from: me, to: current, text, ts: Date.now() / 1000, pending: true };
+  outbox.set(m.id, m);
+  byId.set(m.id, m);
+  sendFrame(m);
+  $("textInput").value = "";
+  render();
+};
+
+// ------------------------------------------------------------ UI
+function setStatus(on) {
+  $("status").textContent = on ? "online" : "reconnecting...";
+  $("status").className = on ? "on" : "";
+}
+
+function contactNames() {
+  const names = new Set(online);
+  for (const m of byId.values()) names.add(m.from === me ? m.to : m.from);
+  names.delete(me);
+  return [...names].sort();
+}
+
+function renderContacts() {
+  const box = $("contacts");
+  box.innerHTML = "";
+  for (const name of contactNames()) {
+    const el = document.createElement("span");
+    el.className = "contact" + (name === current ? " active" : "");
+    el.innerHTML = `<span class="dot ${online.includes(name) ? "online" : ""}"></span>`;
+    el.append(name);
+    if (unread[name]) el.insertAdjacentHTML("beforeend", `<span class="badge">${unread[name]}</span>`);
+    el.onclick = () => { current = name; unread[name] = 0; render(); };
+    box.append(el);
+  }
+}
+
+function render() {
+  renderContacts();
+  const log = $("log");
+  if (!current) return;
+  const chat = [...byId.values()]
+    .filter((m) => (m.from === me && m.to === current) || (m.from === current && m.to === me))
+    .sort((a, b) => (a.seq || Infinity) - (b.seq || Infinity));
+  log.innerHTML = "";
+  for (const m of chat) {
+    const el = document.createElement("div");
+    el.className = "msg" + (m.from === me ? " me" : "");
+    el.textContent = m.text;
+    const time = new Date(m.ts * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+    el.insertAdjacentHTML("beforeend", `<small>${time}${m.pending ? " · sending" : ""}</small>`);
+    log.append(el);
+  }
+  log.scrollTop = log.scrollHeight;
+}
+
+$("joinBtn").onclick = () => {
+  me = $("nameInput").value.trim();
+  if (!me) return;
+  $("login").style.display = "none";
+  $("app").style.display = "flex";
+  connect();
+};
+$("nameInput").onkeydown = (e) => { if (e.key === "Enter") $("joinBtn").click(); };
+</script>
+</body>
+</html>
